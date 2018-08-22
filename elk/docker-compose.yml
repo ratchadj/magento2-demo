@@ -1,0 +1,64 @@
+version: '2'
+services:
+  redis:
+    image: redis:latest
+    container_name: magento2-demo-redis
+    ports:
+      - 6379:6379
+    volumes:
+      - redis-data:/data
+    networks:
+      - logging
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:6.3.2
+    container_name: magento2-demo-elastic
+    environment:
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m -Des.enforce.bootstrap.checks=true"
+      - cluster.name=6_2_2-cluster
+      - bootstrap.memory_lock=false
+      - xpack.security.enabled=false
+      
+    ports:
+      - 9200:9200
+      - 9300:9300
+    volumes:
+      # - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+      - "es-data:/usr/share/elasticsearch/data"
+    networks:
+      - logging
+  
+  logstash:
+    image: docker.elastic.co/logstash/logstash:6.3.2
+    container_name: magento2-demo-logstash
+    command: logstash -f /config/logstash.conf
+    environment:
+      - JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - ./logstash/config:/config
+      - ./logstash/config/logstash.yml:/etc/logstash/logstash.yml
+    networks:
+      - logging
+    depends_on:
+      - elasticsearch
+      - redis
+  
+  kibana:
+    image: docker.elastic.co/kibana/kibana:6.3.2
+    container_name: magento2-demo-kibana
+    ports:
+      - 5601:5601
+    volumes:
+      - ./kibana/config/kibana.yml:/etc/kibana/kibana.yml
+    networks:
+      - logging
+    depends_on:
+      - elasticsearch
+volumes:
+  es-data:
+    driver: local
+  redis-data:
+    driver: local
+networks:
+    logging:
+      driver: bridge

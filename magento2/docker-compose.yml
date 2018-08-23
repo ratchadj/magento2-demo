@@ -2,11 +2,11 @@ version: '2'
 services:
   nginx:
     build: ./nginx/
-    container_name: magento2-demo-nginx
+    container_name: nginx
     ports:
       - "80:8080"
     volumes:
-      - ../code:/var/www/html/magento2
+      - ../source_code/magento2:/var/www/html
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
       - ./nginx/filebeat/filebeat.yml:/etc/filebeat/filebeat.yml
     depends_on:
@@ -16,7 +16,7 @@ services:
 
   # varnish:
   #   build: ./varnish/
-  #   container_name: magento2-demo-varnish
+  #   container_name: varnish
   #   environment:
   #     - VIRTUAL_HOST=blog.benhall.me.uk
   #     - VARNISH_BACKEND_PORT=80
@@ -26,28 +26,25 @@ services:
 
   phpfpm:
     build: ./phpfpm/
-    container_name: magento2-demo-fpm
+    container_name: fpm
     volumes:
-      - ../code:/var/www/html/magento2
-      - ./phpfpm/magento2/setup:/var/www/html/setup
+      - ../source_code/magento2:/var/www/html
+      - ./script:/var/www/html/script
     networks:
       - website
 
   crontab:
     build: ./crontab/
-    container_name: magento2-demo-crontab
+    container_name: crontab
     volumes:
-      - ../code:/var/www/html/magento2
+      - ../source_code/magento2:/var/www/html
     networks:
       - website
   
   mysql:
     image: mysql:5.6
-    container_name: magento2-demo-mysql
-    privileged: true
-    user: root
+    container_name: mysql
     volumes:
-      # - "mysql-data:/var/lib/mysql"
       - "./mysql/mysql56/data:/var/lib/mysql"
       - "./mysql/mysql56/init:/docker-entrypoint-initdb.d"
       # - "./mysql/mysql56/mysql/conf.d:/etc/mysql/conf.d"
@@ -61,9 +58,6 @@ services:
       - "3306:3306"
     networks:
       - website
-# volumes:
-#   mysql-data:
-#     driver: local
 networks:
     website:
       driver: bridge

@@ -2,7 +2,7 @@ version: '2'
 services:
   redis:
     image: redis:latest
-    container_name: magento2-demo-redis
+    container_name: redis
     ports:
       - 6379:6379
     volumes:
@@ -12,7 +12,7 @@ services:
   
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:6.3.2
-    container_name: magento2-demo-elastic
+    container_name: elastic
     environment:
       - "ES_JAVA_OPTS=-Xms512m -Xmx512m -Des.enforce.bootstrap.checks=true"
       - cluster.name=6_2_2-cluster
@@ -30,7 +30,7 @@ services:
   
   logstash:
     image: docker.elastic.co/logstash/logstash:6.3.2
-    container_name: magento2-demo-logstash
+    container_name: logstash
     command: logstash -f /config/logstash.conf
     environment:
       - JAVA_OPTS=-Xms1g -Xmx1g
@@ -45,7 +45,7 @@ services:
   
   kibana:
     image: docker.elastic.co/kibana/kibana:6.3.2
-    container_name: magento2-demo-kibana
+    container_name: kibana
     ports:
       - 5601:5601
     volumes:

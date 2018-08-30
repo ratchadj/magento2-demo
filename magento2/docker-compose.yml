@@ -4,7 +4,7 @@ services:
     build: ./nginx/
     container_name: nginx
     ports:
-      - "80:8080"
+      - "8080:8080"
     volumes:
       - ../source_code/magento2:/var/www/html/magento2
       - ./nginx/b2b.conf:/etc/nginx/conf.d/default.conf
@@ -14,15 +14,17 @@ services:
     networks:
       - website
 
-  # varnish:
-  #   build: ./varnish/
-  #   container_name: varnish
-  #   environment:
-  #     - VIRTUAL_HOST=blog.benhall.me.uk
-  #     - VARNISH_BACKEND_PORT=80
-  #     - VARNISH_BACKEND_HOST=wordpress
-  #   networks:
-  #     - website
+  varnish:
+    build: ./varnish/
+    container_name: varnish
+    ports:
+      - "80:80"
+    environment:
+      - VIRTUAL_HOST=127.0.0.1
+      - VARNISH_BACKEND_PORT=8080
+      - VARNISH_BACKEND_HOST=nginx
+    networks:
+      - website
 
   phpfpm:
     build: ./phpfpm/

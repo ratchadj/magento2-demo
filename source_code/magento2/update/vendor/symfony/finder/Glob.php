@@ -54,19 +54,31 @@ class Glob
         $sizeGlob = strlen($glob);
         for ($i = 0; $i < $sizeGlob; ++$i) {
             $car = $glob[$i];
-            if ($firstByte) {
-                if ($strictLeadingDot && '.' !== $car) {
-                    $regex .= '(?=[^\.])';
+            if ($firstByte && $strictLeadingDot && '.' !== $car) {
+                $regex .= '(?=[^\.])';
+            }
+
+            $firstByte = '/' === $car;
+
+            if ($firstByte && $strictWildcardSlash && isset($glob[$i + 2]) && '**' === $glob[$i + 1].$glob[$i + 2] && (!isset($glob[$i + 3]) || '/' === $glob[$i + 3])) {
+                $car = '[^/]++/';
+                if (!isset($glob[$i + 3])) {
+                    $car .= '?';
                 }
 
-                $firstByte = false;
+                if ($strictLeadingDot) {
+                    $car = '(?=[^\.])'.$car;
+                }
+
+                $car = '/(?:'.$car.')*';
+                $i += 2 + isset($glob[$i + 3]);
+
+                if ('/' === $delimiter) {
+                    $car = str_replace('/', '\\/', $car);
+                }
             }
 
-            if ('/' === $car) {
-                $firstByte = true;
-            }
-
-            if ('.' === $car || '(' === $car || ')' === $car || '|' === $car || '+' === $car || '^' === $car || '$' === $car) {
+            if ($delimiter === $car || '.' === $car || '(' === $car || ')' === $car || '|' === $car || '+' === $car || '^' === $car || '$' === $car) {
                 $regex .= "\\$car";
             } elseif ('*' === $car) {
                 $regex .= $escaping ? '\\*' : ($strictWildcardSlash ? '[^/]*' : '.*');

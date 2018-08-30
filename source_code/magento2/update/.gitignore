@@ -1,5 +1,6 @@
 /var/*
 !/var/.htaccess
+/vendor
 /.buildpath
 /.cache
 /.metadata

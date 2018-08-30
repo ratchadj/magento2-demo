@@ -27,7 +27,7 @@ use Symfony\Component\Process\Pipes\WindowsPipes;
  * @author Fabien Potencier <fabien@symfony.com>
  * @author Romain Neutron <imprec@gmail.com>
  */
-class Process
+class Process implements \IteratorAggregate
 {
     const ERR = 'err';
     const OUT = 'out';
@@ -43,7 +43,13 @@ class Process
     // Timeout Precision in seconds.
     const TIMEOUT_PRECISION = 0.2;
 
+    const ITER_NON_BLOCKING = 1; // By default, iterating over outputs is a blocking call, use this flag to make it non-blocking
+    const ITER_KEEP_OUTPUT = 2;  // By default, outputs are cleared while iterating, use this flag to keep them in memory
+    const ITER_SKIP_OUT = 4;     // Use this flag to skip STDOUT while iterating
+    const ITER_SKIP_ERR = 8;     // Use this flag to skip STDERR while iterating
+
     private $callback;
+    private $hasCallback = false;
     private $commandline;
     private $cwd;
     private $env;
@@ -52,7 +58,7 @@ class Process
     private $lastOutputTime;
     private $timeout;
     private $idleTimeout;
-    private $options;
+    private $options = array('suppress_errors' => true);
     private $exitcode;
     private $fallbackStatus = array();
     private $processInformation;
@@ -67,6 +73,7 @@ class Process
     private $incrementalErrorOutputOffset = 0;
     private $tty;
     private $pty;
+    private $inheritEnv = false;
 
     private $useFileHandles = false;
     /** @var PipesInterface */
@@ -129,16 +136,16 @@ class Process
     /**
      * Constructor.
      *
-     * @param string         $commandline The command line to run
+     * @param string|array   $commandline The command line to run
      * @param string|null    $cwd         The working directory or null to use the working dir of the current PHP process
      * @param array|null     $env         The environment variables or null to use the same environment as the current PHP process
-     * @param string|null    $input       The input
+     * @param mixed|null     $input       The input as stream resource, scalar or \Traversable, or null for no input
      * @param int|float|null $timeout     The timeout in seconds or null to disable
      * @param array          $options     An array of options for proc_open
      *
      * @throws RuntimeException When proc_open is not installed
      */
-    public function __construct($commandline, $cwd = null, array $env = null, $input = null, $timeout = 60, array $options = array())
+    public function __construct($commandline, $cwd = null, array $env = null, $input = null, $timeout = 60, array $options = null)
     {
         if (!function_exists('proc_open')) {
             throw new RuntimeException('The Process class relies on proc_open, which is not available on your PHP installation.');
@@ -158,13 +165,15 @@ class Process
             $this->setEnv($env);
         }
 
-        $this->input = $input;
+        $this->setInput($input);
         $this->setTimeout($timeout);
         $this->useFileHandles = '\\' === DIRECTORY_SEPARATOR;
         $this->pty = false;
-        $this->enhanceWindowsCompatibility = true;
         $this->enhanceSigchildCompatibility = '\\' !== DIRECTORY_SEPARATOR && $this->isSigchildEnabled();
-        $this->options = array_replace(array('suppress_errors' => true, 'binary_pipes' => true), $options);
+        if (null !== $options) {
+            @trigger_error(sprintf('The $options parameter of the %s constructor is deprecated since version 3.3 and will be removed in 4.0.', __CLASS__), E_USER_DEPRECATED);
+            $this->options = array_replace($this->options, $options);
+        }
     }
 
     public function __destruct()
@@ -189,16 +198,20 @@ class Process
      *
      * @param callable|null $callback A PHP callback to run whenever there is some
      *                                output available on STDOUT or STDERR
+     * @param array         $env      An array of additional env vars to set when running the process
      *
      * @return int The exit status code
      *
      * @throws RuntimeException When process can't be launched
      * @throws RuntimeException When process stopped after receiving signal
      * @throws LogicException   In case a callback is provided and output has been disabled
+     *
+     * @final since version 3.3
      */
-    public function run($callback = null)
+    public function run($callback = null/*, array $env = array()*/)
     {
-        $this->start($callback);
+        $env = 1 < func_num_args() ? func_get_arg(1) : null;
+        $this->start($callback, $env);
 
         return $this->wait();
     }
@@ -210,19 +223,23 @@ class Process
      * exits with a non-zero exit code.
      *
      * @param callable|null $callback
+     * @param array         $env      An array of additional env vars to set when running the process
      *
      * @return self
      *
      * @throws RuntimeException       if PHP was compiled with --enable-sigchild and the enhanced sigchild compatibility mode is not enabled
      * @throws ProcessFailedException if the process didn't terminate successfully
+     *
+     * @final since version 3.3
      */
-    public function mustRun($callback = null)
+    public function mustRun(callable $callback = null/*, array $env = array()*/)
     {
         if (!$this->enhanceSigchildCompatibility && $this->isSigchildEnabled()) {
             throw new RuntimeException('This PHP has been compiled with --enable-sigchild. You must use setEnhanceSigchildCompatibility() to use this method.');
         }
+        $env = 1 < func_num_args() ? func_get_arg(1) : null;
 
-        if (0 !== $this->run($callback)) {
+        if (0 !== $this->run($callback, $env)) {
             throw new ProcessFailedException($this);
         }
 
@@ -240,49 +257,76 @@ class Process
      * The callback receives the type of output (out or err) and some bytes from
      * the output in real-time while writing the standard input to the process.
      * It allows to have feedback from the independent process during execution.
-     * If there is no callback passed, the wait() method can be called
-     * with true as a second parameter then the callback will get all data occurred
-     * in (and since) the start call.
      *
      * @param callable|null $callback A PHP callback to run whenever there is some
      *                                output available on STDOUT or STDERR
+     * @param array         $env      An array of additional env vars to set when running the process
      *
      * @throws RuntimeException When process can't be launched
      * @throws RuntimeException When process is already running
      * @throws LogicException   In case a callback is provided and output has been disabled
      */
-    public function start($callback = null)
+    public function start(callable $callback = null/*, array $env = array()*/)
     {
         if ($this->isRunning()) {
             throw new RuntimeException('Process is already running');
         }
-        if ($this->outputDisabled && null !== $callback) {
-            throw new LogicException('Output has been disabled, enable it to allow the use of a callback.');
+        if (2 <= func_num_args()) {
+            $env = func_get_arg(1);
+        } else {
+            if (__CLASS__ !== static::class) {
+                $r = new \ReflectionMethod($this, __FUNCTION__);
+                if (__CLASS__ !== $r->getDeclaringClass()->getName() && (2 > $r->getNumberOfParameters() || 'env' !== $r->getParameters()[0]->name)) {
+                    @trigger_error(sprintf('The %s::start() method expects a second "$env" argument since version 3.3. It will be made mandatory in 4.0.', static::class), E_USER_DEPRECATED);
+                }
+            }
+            $env = null;
         }
 
         $this->resetProcessData();
         $this->starttime = $this->lastOutputTime = microtime(true);
         $this->callback = $this->buildCallback($callback);
+        $this->hasCallback = null !== $callback;
         $descriptors = $this->getDescriptors();
+        $inheritEnv = $this->inheritEnv;
 
-        $commandline = $this->commandline;
+        if (is_array($commandline = $this->commandline)) {
+            $commandline = implode(' ', array_map(array($this, 'escapeArgument'), $commandline));
 
+            if ('\\' !== DIRECTORY_SEPARATOR) {
+                // exec is mandatory to deal with sending a signal to the process
+                $commandline = 'exec '.$commandline;
+            }
+        }
+
+        if (null === $env) {
+            $env = $this->env;
+        } else {
+            if ($this->env) {
+                $env += $this->env;
+            }
+            $inheritEnv = true;
+        }
+
+        $envBackup = array();
+        if (null !== $env && $inheritEnv) {
+            foreach ($env as $k => $v) {
+                $envBackup[$k] = getenv($k);
+                putenv(false === $v || null === $v ? $k : "$k=$v");
+            }
+            $env = null;
+        } elseif (null !== $env) {
+            @trigger_error('Not inheriting environment variables is deprecated since Symfony 3.3 and will always happen in 4.0. Set "Process::inheritEnvironmentVariables()" to true instead.', E_USER_DEPRECATED);
+        }
         if ('\\' === DIRECTORY_SEPARATOR && $this->enhanceWindowsCompatibility) {
-            $commandline = 'cmd /V:ON /E:ON /D /C "('.$commandline.')';
-            foreach ($this->processPipes->getFiles() as $offset => $filename) {
-                $commandline .= ' '.$offset.'>'.ProcessUtils::escapeArgument($filename);
-            }
-            $commandline .= '"';
-
-            if (!isset($this->options['bypass_shell'])) {
-                $this->options['bypass_shell'] = true;
-            }
+            $this->options['bypass_shell'] = true;
+            $commandline = $this->prepareWindowsCommandLine($commandline, $envBackup, $env);
         } elseif (!$this->useFileHandles && $this->enhanceSigchildCompatibility && $this->isSigchildEnabled()) {
             // last exit code is output on the fourth pipe and caught to work around --enable-sigchild
             $descriptors[3] = array('pipe', 'w');
 
             // See https://unix.stackexchange.com/questions/71205/background-process-pipe-input
-            $commandline = '{ ('.$this->commandline.') <&3 3<&- 3>/dev/null & } 3<&0;';
+            $commandline = '{ ('.$commandline.') <&3 3<&- 3>/dev/null & } 3<&0;';
             $commandline .= 'pid=$!; echo $pid >&3; wait $pid; code=$?; echo $code >&3; exit $code';
 
             // Workaround for the bug, when PTS functionality is enabled.
@@ -290,7 +334,11 @@ class Process
             $ptsWorkaround = fopen(__FILE__, 'r');
         }
 
-        $this->process = proc_open($commandline, $descriptors, $this->processPipes->pipes, $this->cwd, $this->env, $this->options);
+        $this->process = proc_open($commandline, $descriptors, $this->processPipes->pipes, $this->cwd, $env, $this->options);
+
+        foreach ($envBackup as $k => $v) {
+            putenv(false === $v ? $k : "$k=$v");
+        }
 
         if (!is_resource($this->process)) {
             throw new RuntimeException('Unable to launch a new process.');
@@ -316,22 +364,26 @@ class Process
      *
      * @param callable|null $callback A PHP callback to run whenever there is some
      *                                output available on STDOUT or STDERR
+     * @param array         $env      An array of additional env vars to set when running the process
      *
-     * @return Process The new process
+     * @return $this
      *
      * @throws RuntimeException When process can't be launched
      * @throws RuntimeException When process is already running
      *
      * @see start()
+     *
+     * @final since version 3.3
      */
-    public function restart($callback = null)
+    public function restart(callable $callback = null/*, array $env = array()*/)
     {
         if ($this->isRunning()) {
             throw new RuntimeException('Process is already running');
         }
+        $env = 1 < func_num_args() ? func_get_arg(1) : null;
 
         $process = clone $this;
-        $process->start($callback);
+        $process->start($callback, $env);
 
         return $process;
     }
@@ -351,20 +403,24 @@ class Process
      * @throws RuntimeException When process stopped after receiving signal
      * @throws LogicException   When process is not yet started
      */
-    public function wait($callback = null)
+    public function wait(callable $callback = null)
     {
         $this->requireProcessIsStarted(__FUNCTION__);
 
         $this->updateStatus(false);
+
         if (null !== $callback) {
+            if (!$this->processPipes->haveReadSupport()) {
+                $this->stop(0);
+                throw new \LogicException('Pass the callback to the Process::start method or enableOutput to use a callback with Process::wait');
+            }
             $this->callback = $this->buildCallback($callback);
         }
 
         do {
             $this->checkTimeout();
             $running = '\\' === DIRECTORY_SEPARATOR ? $this->isRunning() : $this->processPipes->areOpen();
-            $close = '\\' !== DIRECTORY_SEPARATOR || !$running;
-            $this->readPipes(true, $close);
+            $this->readPipes($running, '\\' !== DIRECTORY_SEPARATOR || !$running);
         } while ($running);
 
         while ($this->isRunning()) {
@@ -393,7 +449,7 @@ class Process
      *
      * @param int $signal A valid POSIX signal (see http://www.php.net/manual/en/pcntl.constants.php)
      *
-     * @return Process
+     * @return $this
      *
      * @throws LogicException   In case the process is not running
      * @throws RuntimeException In case --enable-sigchild is activated and the process can't be killed
@@ -409,7 +465,7 @@ class Process
     /**
      * Disables fetching output and error output from the underlying process.
      *
-     * @return Process
+     * @return $this
      *
      * @throws RuntimeException In case the process is already running
      * @throws LogicException   if an idle timeout is set
@@ -431,7 +487,7 @@ class Process
     /**
      * Enables fetching output and error output from the underlying process.
      *
-     * @return Process
+     * @return $this
      *
      * @throws RuntimeException In case the process is already running
      */
@@ -466,15 +522,13 @@ class Process
      */
     public function getOutput()
     {
-        if ($this->outputDisabled) {
-            throw new LogicException('Output has been disabled.');
+        $this->readPipesForOutput(__FUNCTION__);
+
+        if (false === $ret = stream_get_contents($this->stdout, -1, 0)) {
+            return '';
         }
 
-        $this->requireProcessIsStarted(__FUNCTION__);
-
-        $this->readPipes(false, '\\' === DIRECTORY_SEPARATOR ? !$this->processInformation['running'] : true);
-
-        return $this->stdout;
+        return $ret;
     }
 
     /**
@@ -483,36 +537,91 @@ class Process
      * In comparison with the getOutput method which always return the whole
      * output, this one returns the new output since the last call.
      *
+     * @return string The process output since the last call
+     *
      * @throws LogicException in case the output has been disabled
      * @throws LogicException In case the process is not started
-     *
-     * @return string The process output since the last call
      */
     public function getIncrementalOutput()
     {
-        $this->requireProcessIsStarted(__FUNCTION__);
+        $this->readPipesForOutput(__FUNCTION__);
 
-        $data = $this->getOutput();
-
-        $latest = substr($data, $this->incrementalOutputOffset);
+        $latest = stream_get_contents($this->stdout, -1, $this->incrementalOutputOffset);
+        $this->incrementalOutputOffset = ftell($this->stdout);
 
         if (false === $latest) {
             return '';
         }
 
-        $this->incrementalOutputOffset = strlen($data);
-
         return $latest;
+    }
+
+    /**
+     * Returns an iterator to the output of the process, with the output type as keys (Process::OUT/ERR).
+     *
+     * @param int $flags A bit field of Process::ITER_* flags
+     *
+     * @throws LogicException in case the output has been disabled
+     * @throws LogicException In case the process is not started
+     *
+     * @return \Generator
+     */
+    public function getIterator($flags = 0)
+    {
+        $this->readPipesForOutput(__FUNCTION__, false);
+
+        $clearOutput = !(self::ITER_KEEP_OUTPUT & $flags);
+        $blocking = !(self::ITER_NON_BLOCKING & $flags);
+        $yieldOut = !(self::ITER_SKIP_OUT & $flags);
+        $yieldErr = !(self::ITER_SKIP_ERR & $flags);
+
+        while (null !== $this->callback || ($yieldOut && !feof($this->stdout)) || ($yieldErr && !feof($this->stderr))) {
+            if ($yieldOut) {
+                $out = stream_get_contents($this->stdout, -1, $this->incrementalOutputOffset);
+
+                if (isset($out[0])) {
+                    if ($clearOutput) {
+                        $this->clearOutput();
+                    } else {
+                        $this->incrementalOutputOffset = ftell($this->stdout);
+                    }
+
+                    yield self::OUT => $out;
+                }
+            }
+
+            if ($yieldErr) {
+                $err = stream_get_contents($this->stderr, -1, $this->incrementalErrorOutputOffset);
+
+                if (isset($err[0])) {
+                    if ($clearOutput) {
+                        $this->clearErrorOutput();
+                    } else {
+                        $this->incrementalErrorOutputOffset = ftell($this->stderr);
+                    }
+
+                    yield self::ERR => $err;
+                }
+            }
+
+            if (!$blocking && !isset($out[0]) && !isset($err[0])) {
+                yield self::OUT => '';
+            }
+
+            $this->checkTimeout();
+            $this->readPipesForOutput(__FUNCTION__, $blocking);
+        }
     }
 
     /**
      * Clears the process output.
      *
-     * @return Process
+     * @return $this
      */
     public function clearOutput()
     {
-        $this->stdout = '';
+        ftruncate($this->stdout, 0);
+        fseek($this->stdout, 0);
         $this->incrementalOutputOffset = 0;
 
         return $this;
@@ -528,15 +637,13 @@ class Process
      */
     public function getErrorOutput()
     {
-        if ($this->outputDisabled) {
-            throw new LogicException('Output has been disabled.');
+        $this->readPipesForOutput(__FUNCTION__);
+
+        if (false === $ret = stream_get_contents($this->stderr, -1, 0)) {
+            return '';
         }
 
-        $this->requireProcessIsStarted(__FUNCTION__);
-
-        $this->readPipes(false, '\\' === DIRECTORY_SEPARATOR ? !$this->processInformation['running'] : true);
-
-        return $this->stderr;
+        return $ret;
     }
 
     /**
@@ -546,24 +653,21 @@ class Process
      * whole error output, this one returns the new error output since the last
      * call.
      *
+     * @return string The process error output since the last call
+     *
      * @throws LogicException in case the output has been disabled
      * @throws LogicException In case the process is not started
-     *
-     * @return string The process error output since the last call
      */
     public function getIncrementalErrorOutput()
     {
-        $this->requireProcessIsStarted(__FUNCTION__);
+        $this->readPipesForOutput(__FUNCTION__);
 
-        $data = $this->getErrorOutput();
-
-        $latest = substr($data, $this->incrementalErrorOutputOffset);
+        $latest = stream_get_contents($this->stderr, -1, $this->incrementalErrorOutputOffset);
+        $this->incrementalErrorOutputOffset = ftell($this->stderr);
 
         if (false === $latest) {
             return '';
         }
-
-        $this->incrementalErrorOutputOffset = strlen($data);
 
         return $latest;
     }
@@ -571,11 +675,12 @@ class Process
     /**
      * Clears the process output.
      *
-     * @return Process
+     * @return $this
      */
     public function clearErrorOutput()
     {
-        $this->stderr = '';
+        ftruncate($this->stderr, 0);
+        fseek($this->stderr, 0);
         $this->incrementalErrorOutputOffset = 0;
 
         return $this;
@@ -605,7 +710,7 @@ class Process
      * This method relies on the Unix exit code status standardization
      * and might not be relevant for other operating systems.
      *
-     * @return null|string A string representation for the exit status code, null if the Process is not terminated.
+     * @return null|string A string representation for the exit status code, null if the Process is not terminated
      *
      * @see http://tldp.org/LDP/abs/html/exitcodes.html
      * @see http://en.wikipedia.org/wiki/Unix_signal
@@ -795,23 +900,33 @@ class Process
     /**
      * Adds a line to the STDOUT stream.
      *
+     * @internal
+     *
      * @param string $line The line to append
      */
     public function addOutput($line)
     {
         $this->lastOutputTime = microtime(true);
-        $this->stdout .= $line;
+
+        fseek($this->stdout, 0, SEEK_END);
+        fwrite($this->stdout, $line);
+        fseek($this->stdout, $this->incrementalOutputOffset);
     }
 
     /**
      * Adds a line to the STDERR stream.
+     *
+     * @internal
      *
      * @param string $line The line to append
      */
     public function addErrorOutput($line)
     {
         $this->lastOutputTime = microtime(true);
-        $this->stderr .= $line;
+
+        fseek($this->stderr, 0, SEEK_END);
+        fwrite($this->stderr, $line);
+        fseek($this->stderr, $this->incrementalErrorOutputOffset);
     }
 
     /**
@@ -821,13 +936,13 @@ class Process
      */
     public function getCommandLine()
     {
-        return $this->commandline;
+        return is_array($this->commandline) ? implode(' ', array_map(array($this, 'escapeArgument'), $this->commandline)) : $this->commandline;
     }
 
     /**
      * Sets the command line to be executed.
      *
-     * @param string $commandline The command to execute
+     * @param string|array $commandline The command to execute
      *
      * @return self The current Process instance
      */
@@ -883,7 +998,7 @@ class Process
      *
      * @param int|float|null $timeout The timeout in seconds
      *
-     * @return self The current Process instance.
+     * @return self The current Process instance
      *
      * @throws LogicException           if the output is disabled
      * @throws InvalidArgumentException if the timeout is negative
@@ -913,8 +1028,16 @@ class Process
         if ('\\' === DIRECTORY_SEPARATOR && $tty) {
             throw new RuntimeException('TTY mode is not supported on Windows platform.');
         }
-        if ($tty && (!file_exists('/dev/tty') || !is_readable('/dev/tty'))) {
-            throw new RuntimeException('TTY mode requires /dev/tty to be readable.');
+        if ($tty) {
+            static $isTtySupported;
+
+            if (null === $isTtySupported) {
+                $isTtySupported = (bool) @proc_open('echo 1 >/dev/null', array(array('file', '/dev/tty', 'r'), array('file', '/dev/tty', 'w'), array('file', '/dev/tty', 'w')), $pipes);
+            }
+
+            if (!$isTtySupported) {
+                throw new RuntimeException('TTY mode requires /dev/tty to be read/writable.');
+            }
         }
 
         $this->tty = (bool) $tty;
@@ -1001,6 +1124,8 @@ class Process
      *
      * An environment variable value should be a string.
      * If it is an array, the variable is ignored.
+     * If it is false or null, it will be removed when
+     * env vars are otherwise inherited.
      *
      * That happens in PHP when 'argv' is registered into
      * the $_ENV array for instance.
@@ -1016,34 +1141,15 @@ class Process
             return !is_array($value);
         });
 
-        $this->env = array();
-        foreach ($env as $key => $value) {
-            $this->env[$key] = (string) $value;
-        }
+        $this->env = $env;
 
         return $this;
     }
 
     /**
-     * Gets the contents of STDIN.
-     *
-     * @return string|null The current contents
-     *
-     * @deprecated since version 2.5, to be removed in 3.0.
-     *             Use setInput() instead.
-     *             This method is deprecated in favor of getInput.
-     */
-    public function getStdin()
-    {
-        @trigger_error('The '.__METHOD__.' method is deprecated since version 2.5 and will be removed in 3.0. Use the getInput() method instead.', E_USER_DEPRECATED);
-
-        return $this->getInput();
-    }
-
-    /**
      * Gets the Process input.
      *
-     * @return null|string The Process input
+     * @return resource|string|\Iterator|null The Process input
      */
     public function getInput()
     {
@@ -1051,37 +1157,15 @@ class Process
     }
 
     /**
-     * Sets the contents of STDIN.
-     *
-     * @param string|null $stdin The new contents
-     *
-     * @return self The current Process instance
-     *
-     * @deprecated since version 2.5, to be removed in 3.0.
-     *             Use setInput() instead.
-     *
-     * @throws LogicException           In case the process is running
-     * @throws InvalidArgumentException In case the argument is invalid
-     */
-    public function setStdin($stdin)
-    {
-        @trigger_error('The '.__METHOD__.' method is deprecated since version 2.5 and will be removed in 3.0. Use the setInput() method instead.', E_USER_DEPRECATED);
-
-        return $this->setInput($stdin);
-    }
-
-    /**
      * Sets the input.
      *
      * This content will be passed to the underlying process standard input.
      *
-     * @param mixed $input The content
+     * @param resource|scalar|\Traversable|null $input The content
      *
      * @return self The current Process instance
      *
      * @throws LogicException In case the process is running
-     *
-     * Passing an object as an input is deprecated since version 2.5 and will be removed in 3.0.
      */
     public function setInput($input)
     {
@@ -1089,7 +1173,7 @@ class Process
             throw new LogicException('Input can not be set while the process is running.');
         }
 
-        $this->input = ProcessUtils::validateInput(sprintf('%s::%s', __CLASS__, __FUNCTION__), $input);
+        $this->input = ProcessUtils::validateInput(__METHOD__, $input);
 
         return $this;
     }
@@ -1098,9 +1182,13 @@ class Process
      * Gets the options for proc_open.
      *
      * @return array The current options
+     *
+     * @deprecated since version 3.3, to be removed in 4.0.
      */
     public function getOptions()
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0.', __METHOD__), E_USER_DEPRECATED);
+
         return $this->options;
     }
 
@@ -1110,9 +1198,13 @@ class Process
      * @param array $options The new options
      *
      * @return self The current Process instance
+     *
+     * @deprecated since version 3.3, to be removed in 4.0.
      */
     public function setOptions(array $options)
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0.', __METHOD__), E_USER_DEPRECATED);
+
         $this->options = $options;
 
         return $this;
@@ -1124,9 +1216,13 @@ class Process
      * This is true by default.
      *
      * @return bool
+     *
+     * @deprecated since version 3.3, to be removed in 4.0. Enhanced Windows compatibility will always be enabled.
      */
     public function getEnhanceWindowsCompatibility()
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0. Enhanced Windows compatibility will always be enabled.', __METHOD__), E_USER_DEPRECATED);
+
         return $this->enhanceWindowsCompatibility;
     }
 
@@ -1136,9 +1232,13 @@ class Process
      * @param bool $enhance
      *
      * @return self The current Process instance
+     *
+     * @deprecated since version 3.3, to be removed in 4.0. Enhanced Windows compatibility will always be enabled.
      */
     public function setEnhanceWindowsCompatibility($enhance)
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0. Enhanced Windows compatibility will always be enabled.', __METHOD__), E_USER_DEPRECATED);
+
         $this->enhanceWindowsCompatibility = (bool) $enhance;
 
         return $this;
@@ -1148,9 +1248,13 @@ class Process
      * Returns whether sigchild compatibility mode is activated or not.
      *
      * @return bool
+     *
+     * @deprecated since version 3.3, to be removed in 4.0. Sigchild compatibility will always be enabled.
      */
     public function getEnhanceSigchildCompatibility()
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0. Sigchild compatibility will always be enabled.', __METHOD__), E_USER_DEPRECATED);
+
         return $this->enhanceSigchildCompatibility;
     }
 
@@ -1164,12 +1268,48 @@ class Process
      * @param bool $enhance
      *
      * @return self The current Process instance
+     *
+     * @deprecated since version 3.3, to be removed in 4.0.
      */
     public function setEnhanceSigchildCompatibility($enhance)
     {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0. Sigchild compatibility will always be enabled.', __METHOD__), E_USER_DEPRECATED);
+
         $this->enhanceSigchildCompatibility = (bool) $enhance;
 
         return $this;
+    }
+
+    /**
+     * Sets whether environment variables will be inherited or not.
+     *
+     * @param bool $inheritEnv
+     *
+     * @return self The current Process instance
+     */
+    public function inheritEnvironmentVariables($inheritEnv = true)
+    {
+        if (!$inheritEnv) {
+            @trigger_error('Not inheriting environment variables is deprecated since Symfony 3.3 and will always happen in 4.0. Set "Process::inheritEnvironmentVariables()" to true instead.', E_USER_DEPRECATED);
+        }
+
+        $this->inheritEnv = (bool) $inheritEnv;
+
+        return $this;
+    }
+
+    /**
+     * Returns whether environment variables will be inherited or not.
+     *
+     * @return bool
+     *
+     * @deprecated since version 3.3, to be removed in 4.0. Environment variables will always be inherited.
+     */
+    public function areEnvironmentVariablesInherited()
+    {
+        @trigger_error(sprintf('The %s() method is deprecated since version 3.3 and will be removed in 4.0. Environment variables will always be inherited.', __METHOD__), E_USER_DEPRECATED);
+
+        return $this->inheritEnv;
     }
 
     /**
@@ -1216,7 +1356,7 @@ class Process
             return $result = false;
         }
 
-        return $result = (bool) @proc_open('echo 1', array(array('pty'), array('pty'), array('pty')), $pipes);
+        return $result = (bool) @proc_open('echo 1 >/dev/null', array(array('pty'), array('pty'), array('pty')), $pipes);
     }
 
     /**
@@ -1226,13 +1366,16 @@ class Process
      */
     private function getDescriptors()
     {
+        if ($this->input instanceof \Iterator) {
+            $this->input->rewind();
+        }
         if ('\\' === DIRECTORY_SEPARATOR) {
-            $this->processPipes = WindowsPipes::create($this, $this->input);
+            $this->processPipes = new WindowsPipes($this->input, !$this->outputDisabled || $this->hasCallback);
         } else {
-            $this->processPipes = UnixPipes::create($this, $this->input);
+            $this->processPipes = new UnixPipes($this->isTty(), $this->isPty(), $this->input, !$this->outputDisabled || $this->hasCallback);
         }
 
-        return $this->processPipes->getDescriptors($this->outputDisabled);
+        return $this->processPipes->getDescriptors();
     }
 
     /**
@@ -1245,29 +1388,35 @@ class Process
      *
      * @return \Closure A PHP closure
      */
-    protected function buildCallback($callback)
+    protected function buildCallback(callable $callback = null)
     {
-        $that = $this;
+        if ($this->outputDisabled) {
+            return function ($type, $data) use ($callback) {
+                if (null !== $callback) {
+                    call_user_func($callback, $type, $data);
+                }
+            };
+        }
+
         $out = self::OUT;
-        $callback = function ($type, $data) use ($that, $callback, $out) {
+
+        return function ($type, $data) use ($callback, $out) {
             if ($out == $type) {
-                $that->addOutput($data);
+                $this->addOutput($data);
             } else {
-                $that->addErrorOutput($data);
+                $this->addErrorOutput($data);
             }
 
             if (null !== $callback) {
                 call_user_func($callback, $type, $data);
             }
         };
-
-        return $callback;
     }
 
     /**
      * Updates the status of the process, reads pipes.
      *
-     * @param bool $blocking Whether to use a blocking read call.
+     * @param bool $blocking Whether to use a blocking read call
      */
     protected function updateStatus($blocking)
     {
@@ -1276,14 +1425,15 @@ class Process
         }
 
         $this->processInformation = proc_get_status($this->process);
+        $running = $this->processInformation['running'];
 
-        $this->readPipes($blocking, '\\' === DIRECTORY_SEPARATOR ? !$this->processInformation['running'] : true);
+        $this->readPipes($running && $blocking, '\\' !== DIRECTORY_SEPARATOR || !$running);
 
         if ($this->fallbackStatus && $this->enhanceSigchildCompatibility && $this->isSigchildEnabled()) {
             $this->processInformation = $this->fallbackStatus + $this->processInformation;
         }
 
-        if (!$this->processInformation['running']) {
+        if (!$running) {
             $this->close();
         }
     }
@@ -1307,6 +1457,25 @@ class Process
         phpinfo(INFO_GENERAL);
 
         return self::$sigchild = false !== strpos(ob_get_clean(), '--enable-sigchild');
+    }
+
+    /**
+     * Reads pipes for the freshest output.
+     *
+     * @param string $caller   The name of the method that needs fresh outputs
+     * @param bool   $blocking Whether to use blocking calls or not
+     *
+     * @throws LogicException in case output has been disabled or process is not started
+     */
+    private function readPipesForOutput($caller, $blocking = false)
+    {
+        if ($this->outputDisabled) {
+            throw new LogicException('Output has been disabled.');
+        }
+
+        $this->requireProcessIsStarted($caller);
+
+        $this->updateStatus($blocking);
     }
 
     /**
@@ -1334,8 +1503,8 @@ class Process
     /**
      * Reads pipes, executes callback.
      *
-     * @param bool $blocking Whether to use blocking calls or not.
-     * @param bool $close    Whether to close file handles or not.
+     * @param bool $blocking Whether to use blocking calls or not
+     * @param bool $close    Whether to close file handles or not
      */
     private function readPipes($blocking, $close)
     {
@@ -1393,8 +1562,8 @@ class Process
         $this->exitcode = null;
         $this->fallbackStatus = array();
         $this->processInformation = null;
-        $this->stdout = null;
-        $this->stderr = null;
+        $this->stdout = fopen('php://temp/maxmemory:'.(1024 * 1024), 'wb+');
+        $this->stderr = fopen('php://temp/maxmemory:'.(1024 * 1024), 'wb+');
         $this->process = null;
         $this->latestSignal = null;
         $this->status = self::STATUS_READY;
@@ -1458,10 +1627,62 @@ class Process
         return true;
     }
 
+    private function prepareWindowsCommandLine($cmd, array &$envBackup, array &$env = null)
+    {
+        $uid = uniqid('', true);
+        $varCount = 0;
+        $varCache = array();
+        $cmd = preg_replace_callback(
+            '/"(?:(
+                [^"%!^]*+
+                (?:
+                    (?: !LF! | "(?:\^[%!^])?+" )
+                    [^"%!^]*+
+                )++
+            ) | [^"]*+ )"/x',
+            function ($m) use (&$envBackup, &$env, &$varCache, &$varCount, $uid) {
+                if (!isset($m[1])) {
+                    return $m[0];
+                }
+                if (isset($varCache[$m[0]])) {
+                    return $varCache[$m[0]];
+                }
+                if (false !== strpos($value = $m[1], "\0")) {
+                    $value = str_replace("\0", '?', $value);
+                }
+                if (false === strpbrk($value, "\"%!\n")) {
+                    return '"'.$value.'"';
+                }
+
+                $value = str_replace(array('!LF!', '"^!"', '"^%"', '"^^"', '""'), array("\n", '!', '%', '^', '"'), $value);
+                $value = '"'.preg_replace('/(\\\\*)"/', '$1$1\\"', $value).'"';
+                $var = $uid.++$varCount;
+
+                if (null === $env) {
+                    putenv("$var=$value");
+                } else {
+                    $env[$var] = $value;
+                }
+
+                $envBackup[$var] = false;
+
+                return $varCache[$m[0]] = '!'.$var.'!';
+            },
+            $cmd
+        );
+
+        $cmd = 'cmd /V:ON /E:ON /D /C ('.str_replace("\n", ' ', $cmd).')';
+        foreach ($this->processPipes->getFiles() as $offset => $filename) {
+            $cmd .= ' '.$offset.'>"'.$filename.'"';
+        }
+
+        return $cmd;
+    }
+
     /**
      * Ensures the process is running or terminated, throws a LogicException if the process has a not started.
      *
-     * @param string $functionName The function name that was called.
+     * @param string $functionName The function name that was called
      *
      * @throws LogicException If the process has not run.
      */
@@ -1475,7 +1696,7 @@ class Process
     /**
      * Ensures the process is terminated, throws a LogicException if the process has a status different than `terminated`.
      *
-     * @param string $functionName The function name that was called.
+     * @param string $functionName The function name that was called
      *
      * @throws LogicException If the process is not yet terminated.
      */
@@ -1484,5 +1705,31 @@ class Process
         if (!$this->isTerminated()) {
             throw new LogicException(sprintf('Process must be terminated before calling %s.', $functionName));
         }
+    }
+
+    /**
+     * Escapes a string to be used as a shell argument.
+     *
+     * @param string $argument The argument that will be escaped
+     *
+     * @return string The escaped argument
+     */
+    private function escapeArgument($argument)
+    {
+        if ('\\' !== DIRECTORY_SEPARATOR) {
+            return "'".str_replace("'", "'\\''", $argument)."'";
+        }
+        if ('' === $argument = (string) $argument) {
+            return '""';
+        }
+        if (false !== strpos($argument, "\0")) {
+            $argument = str_replace("\0", '?', $argument);
+        }
+        if (!preg_match('/[\/()%!^"<>&|\s]/', $argument)) {
+            return $argument;
+        }
+        $argument = preg_replace('/(\\\\+)$/', '$1$1', $argument);
+
+        return '"'.str_replace(array('"', '^', '%', '!', "\n"), array('""', '"^^"', '"^%"', '"^!"', '!LF!'), $argument).'"';
     }
 }

@@ -1,7 +1,7 @@
-FROM php:7.0.10-fpm
+FROM php:7.1.21-fpm
 
 ENV PHP_INI_DIR /usr/local/etc/php/
-ENV WORKDIR /var/www/html
+ENV WORKDIR /var/www/html/magento2
 WORKDIR ${WORKDIR}
 
 COPY ./customized/customized.ini $PHP_INI_DIR/conf.d/customized.ini
